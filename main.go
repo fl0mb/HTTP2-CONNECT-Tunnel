@@ -23,8 +23,7 @@ func NoRedirect(req *http.Request, via []*http.Request) error {
 }
 
 type proxyConn struct {
-	rxChan chan []byte
-	//rxBuff       []byte
+	rxChan       chan []byte
 	rxBuff       bytes.Buffer
 	framer       *http2.Framer
 	proxyAddress string
@@ -38,23 +37,15 @@ func (p *proxyConn) Write(b []byte) (n int, err error) {
 }
 
 func (p *proxyConn) Read(b []byte) (n int, err error) {
-	// If our internal buffer is empty, we need to block and wait for
-	// the next data frame to arrive from the background goroutine.
+	// If our internal buffer is empty, we need to block and wait for next data
 	if p.rxBuff.Len() == 0 {
 		data, ok := <-p.rxChan
 		if !ok {
-			// The channel was closed, which signifies the end of the stream.
 			return 0, io.EOF
 		}
-		// Write the new data chunk into our buffer. This is safe because
-		// this Read method is the only consumer of the rxChan and the only
-		// writer to rxBuff.
 		p.rxBuff.Write(data)
 	}
-
-	// Read from our internal buffer into the caller's provided slice 'b'.
-	// bytes.Buffer.Read will read up to len(b) bytes and return the
-	// number of bytes read.
+	// Always read from buffer
 	return p.rxBuff.Read(b)
 
 }
@@ -203,14 +194,6 @@ func getProxyConn(framer *http2.Framer, targetAddress string, rxChan chan<- []by
 
 		}
 
-		// // CONNECT tunnel established
-		// if proxyConnAcknowleged {
-		// 	//framer.WriteData(1, false, []byte("GET / HTTP/1.1\r\nHost: google.de\r\n\r\n"))
-		// 	//proxyConn.Write([]byte("GET / HTTP/1.1\r\nHost: google.de\r\n\r\n"))
-		// 	log.Println("CONNECT Tunnel established!")
-		// 	readyChan <- struct{}{}
-		// }
-
 	}
 
 }
@@ -222,16 +205,14 @@ func main() {
 
 	framer, localAddr, conn := getHTTP2Conn(*proxyFlag)
 	defer conn.Close()
-	//rxChan := make(chan []byte)
-	rxChan := make(chan []byte, 1)
+	rxChan := make(chan []byte) // make buffered just in case?
 	readyChan := make(chan struct{})
 	proxyConn := &proxyConn{rxChan: rxChan, framer: framer, localAddr: localAddr}
-	//go proxyConn.handle()
 	go getProxyConn(framer, *targetFlag, rxChan, readyChan)
 	<-readyChan // wait until ready
 
 	client := tls.Client(proxyConn, &tls.Config{InsecureSkipVerify: true})
-	_, err := client.Write([]byte("GET / HTTP/1.1\r\nHost: google.de\r\n\r\n"))
+	_, err := fmt.Fprintf(client, "GET / HTTP/1.1\r\nHost: %s\r\n\r\n", *targetFlag) // port is usually omitted for 80/443 but this is correct
 	//_, err := proxyConn.Write([]byte("GET / HTTP/1.1\r\nHost: google.de\r\n\r\n"))
 	if err != nil {
 		log.Fatalf("Error writing to TLS connection: %s", err)
