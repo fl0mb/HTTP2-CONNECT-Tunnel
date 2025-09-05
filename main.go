@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"errors"
 	"flag"
@@ -102,7 +103,7 @@ func getHTTP2Conn(proxyAddress string) (*http2.Framer, string, net.Conn) {
 
 }
 
-func getProxyConn(framer *http2.Framer, targetAddress string, rxChan chan<- []byte, readyChan chan struct{}) {
+func getProxyConn(framer *http2.Framer, targetAddress string, rxChan chan<- []byte, readyChan chan struct{}, ctx context.Context) {
 	defer close(rxChan) // Ensure the channel is closed on exit to signal EOF.
 
 	framer.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
@@ -114,86 +115,98 @@ func getProxyConn(framer *http2.Framer, targetAddress string, rxChan chan<- []by
 	var readyToInitiate bool      // true when http2 connection was successful
 	var proxyConnAcknowleged bool // true when CONNECT was confirmed by a headers frame with status 200
 
+	//loop:
 	for {
-		f, err := framer.ReadFrame()
-		if err != nil {
-			log.Fatalf("Error reading frame: %s", err)
-			break
-		}
+		if ctx.Err() == nil {
+			f, err := framer.ReadFrame()
+			if err != nil {
+				//log.Fatalf("Error reading frame: %s", err)
+				log.Printf("Error reading frame: %s", err)
+				break
+			}
 
-		switch f := f.(type) {
-		case *http2.DataFrame:
-			log.Printf("Received frame: %v\n", f.FrameHeader.Type)
-			//log.Printf("%s", f.Data())
-			rxChan <- f.Data()
-		case *http2.PingFrame:
-			log.Printf("Received frame: %v\n", f.FrameHeader.Type)
-			//framer.WritePing(true)
-		case *http2.MetaHeadersFrame:
-			log.Printf("Received frame: %v\n", f.FrameHeader.Type)
-			if readyToInitiate && !proxyConnAcknowleged && f.FrameHeader.StreamID == 1 {
+			switch f := f.(type) {
+			case *http2.DataFrame:
+				log.Printf("Received frame: %v\n", f.FrameHeader.Type)
+				//log.Printf("%s", f.Data())
+				rxChan <- f.Data()
+			case *http2.PingFrame:
+				log.Printf("Received frame: %v\n", f.FrameHeader.Type)
+				//framer.WritePing(true)
+			case *http2.MetaHeadersFrame:
+				log.Printf("Received frame: %v\n", f.FrameHeader.Type)
 				for _, v := range f.Fields {
-					log.Printf("\t%s: %s\n", v.Name, v.Value)
-					if v.Name == ":status" && v.Value == "200" {
-						proxyConnAcknowleged = true
-
+					if v.Name == ":status" && v.Value != "200" {
+						log.Printf("Aborting, received :status %s", v.Value)
+						close(readyChan)
+						//break loop
+						return
 					}
 				}
-				// CONNECT tunnel established
-				if proxyConnAcknowleged {
-					log.Println("CONNECT Tunnel established!")
-					readyChan <- struct{}{}
+				if readyToInitiate && !proxyConnAcknowleged && f.FrameHeader.StreamID == 1 {
+					for _, v := range f.Fields {
+						log.Printf("\t%s: %s\n", v.Name, v.Value)
+						if v.Name == ":status" && v.Value == "200" {
+							proxyConnAcknowleged = true
+						}
+					}
+					// CONNECT tunnel established
+					if proxyConnAcknowleged {
+						log.Println("CONNECT Tunnel established!")
+						readyChan <- struct{}{}
+					}
 				}
-			}
-		case *http2.GoAwayFrame:
-			log.Printf("Received frame: %v\n", f.FrameHeader.Type)
-		case *http2.SettingsFrame:
-			log.Printf("Received frame: %v, ACK: %t\n", f.FrameHeader.Type, f.IsAck())
-			if !f.IsAck() {
-				err := framer.WriteSettingsAck()
-				if err != nil {
-					log.Fatalf("Error acknowledging settings frame: %s", err)
+			case *http2.GoAwayFrame:
+				log.Printf("Received frame: %v\n", f.FrameHeader.Type)
+			case *http2.SettingsFrame:
+				log.Printf("Received frame: %v, ACK: %t\n", f.FrameHeader.Type, f.IsAck())
+				if !f.IsAck() {
+					err := framer.WriteSettingsAck()
+					if err != nil {
+						log.Fatalf("Error acknowledging settings frame: %s", err)
+					}
+				} else {
+					readyToInitiate = true
 				}
-			} else {
-				readyToInitiate = true
+			case *http2.WindowUpdateFrame:
+				log.Printf("Received frame: %v\n", f.FrameHeader.Type)
+			case *http2.RSTStreamFrame:
+				log.Printf("Received RST_STREAM frame for stream %d. Error: %s", f.StreamID, f.ErrCode)
+				if f.StreamID == 1 {
+					return
+				}
+			default:
+				log.Printf("Transport: unhandled response frame type %T", f)
 			}
-		case *http2.WindowUpdateFrame:
-			log.Printf("Received frame: %v\n", f.FrameHeader.Type)
-		case *http2.RSTStreamFrame:
-			log.Printf("Received RST_STREAM frame for stream %d. Error: %s", f.StreamID, f.ErrCode)
-			if f.StreamID == 1 {
-				return
+
+			// http2 works now initiate CONNECT tunnel
+			if readyToInitiate && !proxyConnAcknowleged {
+				var hpackBuf bytes.Buffer
+				hpackEncoder := hpack.NewEncoder(&hpackBuf)
+				connectHeaders := []hpack.HeaderField{
+					{Name: ":method", Value: "CONNECT"},
+					{Name: ":authority", Value: targetAddress},
+				}
+
+				log.Println("Encoding CONNECT headers with HPACK...")
+				for _, hf := range connectHeaders {
+					log.Printf("  > Encoding: %s: %s", hf.Name, hf.Value)
+					if err := hpackEncoder.WriteField(hf); err != nil {
+						log.Fatalf("HPACK encoding failed for %q: %v", hf.Name, err)
+					}
+				}
+
+				framer.WriteHeaders(http2.HeadersFrameParam{
+					StreamID:      1,
+					EndHeaders:    true,
+					EndStream:     false,
+					BlockFragment: hpackBuf.Bytes(),
+				})
+
 			}
-		default:
-			log.Printf("Transport: unhandled response frame type %T", f)
+		} else {
+			return
 		}
-
-		// http2 works now initiate CONNECT tunnel
-		if readyToInitiate && !proxyConnAcknowleged {
-			var hpackBuf bytes.Buffer
-			hpackEncoder := hpack.NewEncoder(&hpackBuf)
-			connectHeaders := []hpack.HeaderField{
-				{Name: ":method", Value: "CONNECT"},
-				{Name: ":authority", Value: targetAddress},
-			}
-
-			log.Println("Encoding CONNECT headers with HPACK...")
-			for _, hf := range connectHeaders {
-				log.Printf("  > Encoding: %s: %s", hf.Name, hf.Value)
-				if err := hpackEncoder.WriteField(hf); err != nil {
-					log.Fatalf("HPACK encoding failed for %q: %v", hf.Name, err)
-				}
-			}
-
-			framer.WriteHeaders(http2.HeadersFrameParam{
-				StreamID:      1,
-				EndHeaders:    true,
-				EndStream:     false,
-				BlockFragment: hpackBuf.Bytes(),
-			})
-
-		}
-
 	}
 
 }
@@ -201,6 +214,7 @@ func getProxyConn(framer *http2.Framer, targetAddress string, rxChan chan<- []by
 func main() {
 	proxyFlag := flag.String("x", "172.17.0.2:10001", "proxy address e.g. \"172.17.0.2:10001\"")
 	targetFlag := flag.String("t", "google.de:443", "target address e.g. \"google.de:80\"")
+	modeFlag := flag.String("p", "plain", "mode: use \"plain\" for plaintext or \"tls\" to create encrypted connection to target")
 	flag.Parse()
 
 	framer, localAddr, conn := getHTTP2Conn(*proxyFlag)
@@ -208,34 +222,52 @@ func main() {
 	rxChan := make(chan []byte) // make buffered just in case?
 	readyChan := make(chan struct{})
 	proxyConn := &proxyConn{rxChan: rxChan, framer: framer, localAddr: localAddr}
-	go getProxyConn(framer, *targetFlag, rxChan, readyChan)
-	<-readyChan // wait until ready
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
+	go getProxyConn(framer, *targetFlag, rxChan, readyChan, ctx)
+	_, ok := <-readyChan // wait until ready
+	if !ok {
+		return
+	}
 
-	client := tls.Client(proxyConn, &tls.Config{InsecureSkipVerify: true})
-	_, err := fmt.Fprintf(client, "GET / HTTP/1.1\r\nHost: %s\r\n\r\n", *targetFlag) // port is usually omitted for 80/443 but this is correct
-	//_, err := proxyConn.Write([]byte("GET / HTTP/1.1\r\nHost: google.de\r\n\r\n"))
-	if err != nil {
-		log.Fatalf("Error writing to TLS connection: %s", err)
+	var client net.Conn
+	switch {
+	case *modeFlag == "plain":
+		_, err := fmt.Fprintf(proxyConn, "GET / HTTP/1.1\r\nHost: %s\r\n\r\n", *targetFlag) // port is usually omitted for 80/443 but this is still correct
+		if err != nil {
+			log.Fatalf("Error writing to plain connection: %s", err)
+		}
+		client = proxyConn
+	case *modeFlag == "tls":
+		client = tls.Client(proxyConn, &tls.Config{InsecureSkipVerify: true})
+		_, err := fmt.Fprintf(client, "GET / HTTP/1.1\r\nHost: %s\r\n\r\n", *targetFlag) // port is usually omitted for 80/443 but this is still correct
+		if err != nil {
+			log.Fatalf("Error writing to TLS connection: %s", err)
+		}
 	}
 	log.Println("successfully written data")
-
 	b := make([]byte, 512)
 	for {
 		n, err := client.Read(b)
-		//n, err := proxyConn.Read(b)
 		if n > 0 {
 			fmt.Print(string(b[:n])) // IMPORTANT: Only process the sub-slice b[:n] which contains the valid data.
 			if strings.HasSuffix(string(b[:n]), "\r\n") {
+				cancel()
 				break
+
 			}
 		}
 		if err != nil {
 			if err != io.EOF {
 				log.Printf("Error reading from proxy connection: %s", err)
 			}
+			cancel()
 			break
 		}
 	}
+
+	//strg+c handler
+
 	//close(readyChan)
 	// use a cancellable context passed to getProxyConn
 

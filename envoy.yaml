@@ -22,7 +22,7 @@ static_resources:
         typed_config:
           "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
           stat_prefix: ingress_http
-          #codec_type: HTTP2
+          codec_type: HTTP2
           route_config:
             name: local_route
             virtual_hosts:
