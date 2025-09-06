@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -160,49 +161,6 @@ func (t *tunnelConn) RemoteAddr() net.Addr {
 	return &net.TCPAddr{IP: net.IP(s[0]), Port: port}
 }
 
-// func (p *proxyConn) Write(b []byte) (n int, err error) {
-// 	err = p.framer.WriteData(1, false, b)
-// 	n = len(b)
-// 	return
-// }
-
-// func (p *proxyConn) Read(b []byte) (n int, err error) {
-// 	// If our internal buffer is empty, we need to block and wait for next data
-// 	if p.rxBuff.Len() == 0 {
-// 		data, ok := <-p.rxChan
-// 		if !ok {
-// 			return 0, io.EOF
-// 		}
-// 		p.rxBuff.Write(data)
-// 	}
-// 	// Always read from buffer
-// 	return p.rxBuff.Read(b)
-
-// }
-
-// func (p *proxyConn) Close() error {
-// 	log.Fatalln("Proxy connection closed")
-// 	return nil
-// }
-
-// func (p *proxyConn) LocalAddr() net.Addr {
-// 	s := strings.Split(p.localAddr, ":")
-// 	port, err := strconv.Atoi(s[1])
-// 	if err != nil {
-// 		log.Printf("Error getting remote address: %s", err)
-// 	}
-// 	return &net.TCPAddr{IP: net.IP(s[0]), Port: port}
-// }
-
-// func (p *proxyConn) RemoteAddr() net.Addr {
-// 	s := strings.Split(p.proxyAddress, ":")
-// 	port, err := strconv.Atoi(s[1])
-// 	if err != nil {
-// 		log.Printf("Error getting remote address: %s", err)
-// 	}
-// 	return &net.TCPAddr{IP: net.IP(s[0]), Port: port}
-// }
-
 var ErrNotImplemented = errors.New("not implemented")
 
 func (p *tunnelConn) SetDeadline(t time.Time) error {
@@ -217,22 +175,24 @@ func (p *tunnelConn) SetWriteDeadline(t time.Time) error {
 	return ErrNotImplemented
 }
 
-// func (p *proxyConn) SetDeadline(t time.Time) error {
-// 	return ErrNotImplemented
-// }
-
-// func (p *proxyConn) SetReadDeadline(t time.Time) error {
-// 	return ErrNotImplemented
-// }
-
-// func (p *proxyConn) SetWriteDeadline(t time.Time) error {
-// 	return ErrNotImplemented
-// }
-
 func getHTTP2Conn(proxyAddress string) (*http2.Framer, string, net.Conn) {
-	conn, err := net.Dial("tcp", proxyAddress)
+	url, err := url.Parse(proxyAddress)
 	if err != nil {
-		log.Fatalln("Error connecting:", err)
+		log.Fatalln("Error creating proxy url", err)
+	}
+	var conn net.Conn
+	if url.Scheme == "http" {
+		conn, err = net.Dial("tcp", url.Host)
+		if err != nil {
+			log.Fatalln("Error connecting:", err)
+		}
+	}
+	if url.Scheme == "https" {
+		conn, err = tls.Dial("tcp", url.Host, &tls.Config{InsecureSkipVerify: true})
+		//conn, err = net.Dial("tcp", url.Host)
+		if err != nil {
+			log.Fatalln("Error connecting:", err)
+		}
 	}
 
 	_, err = conn.Write([]byte(http2.ClientPreface))
@@ -277,7 +237,7 @@ func (p *proxyConn) connect(streamID uint32, targetAddress string) {
 }
 
 func (p *proxyConn) connectProxy(http2readyChan chan struct{}, resultChan chan proberesult, rxChan chan []byte) { //rxChan chan<- []byte
-	//defer close(rxChan) // Ensure the channel is closed on exit to signal EOF.
+	defer close(rxChan)
 	defer close(http2readyChan)
 	defer close(resultChan)
 
@@ -287,7 +247,6 @@ func (p *proxyConn) connectProxy(http2readyChan chan struct{}, resultChan chan p
 		slog.Debug(fmt.Sprintf("Error writing http2 settings frame: %s", err))
 	}
 
-	//loop:
 	for {
 		f, err := p.framer.ReadFrame()
 		if err != nil {
@@ -312,15 +271,6 @@ func (p *proxyConn) connectProxy(http2readyChan chan struct{}, resultChan chan p
 			//p.framer.WritePing(true)
 		case *http2.MetaHeadersFrame:
 			slog.Debug(fmt.Sprintf("Received frame: %v\n", f.FrameHeader.Type))
-			// for _, v := range f.Fields {
-			// 	//break loop
-			// 	if v.Name == ":status" && v.Value != "200" {
-			// 		log.Printf("Aborting, received :status %s", v.Value)
-			// 		close(readyChan)
-			// 		return
-			// 	}
-			// }
-
 			for _, v := range f.Fields {
 				slog.Debug(fmt.Sprintf("\t%s: %s\n", v.Name, v.Value))
 				// CONNECT tunnel established
@@ -390,7 +340,6 @@ func (p *proxyConn) getTunnelConn(ports []int, resultChan chan proberesult, targ
 	p.connect(p.nextStreamID, target)
 	for result := range resultChan {
 		if result.status == "connected" && result.address == target {
-			//slog.Info(fmt.Sprintf("Found open port: %s", result.address))
 			return &tunnelConn{proxyConn: p, rxChan: rxChan, streamId: p.nextStreamID}, nil
 		}
 	}
@@ -438,7 +387,7 @@ func exampleTunnelConnUsage(t *tunnelConn) {
 }
 
 func main() {
-	proxyFlag := flag.String("x", "172.17.0.2:10001", "proxy address e.g. \"172.17.0.2:10001\"")
+	proxyFlag := flag.String("x", "http://172.17.0.2:10001", "proxy address e.g. \"http://172.17.0.2:10001\"")
 	targetFlag := flag.String("t", "google.de", "target address e.g. \"example.com\"")
 	portsFlag := flag.String("p", "", "port(s) to scan or connect to, format similar to nmap e.g. 80,443,1000-2000")
 	connectModeFlag := flag.Bool("c", false, "create a single CONNECT tunnel")
@@ -506,7 +455,8 @@ func main() {
 
 	}
 
-	//strg+c handler
+	// strg+c handler
+	// specify how to use connect mode example e.g. tls or plain
 	// support not just h2c but tls too - take it from proxy specification e.g. https://proxy.org
 
 }
