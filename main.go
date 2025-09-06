@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,86 +26,16 @@ func NoRedirect(req *http.Request, via []*http.Request) error {
 	return http.ErrUseLastResponse
 }
 
-// ParsePorts takes a string of ports and returns a sorted slice of unique integers.
-// It supports formats like "80", "80,443", "80-90", "22,80,443,1000-2000".
-func ParsePorts(portStr string) ([]int, error) {
-	ports := make(map[int]struct{})
-	if portStr == "" {
-		return []int{}, errors.New("no port specified")
-	}
-	parts := strings.Split(portStr, ",")
-
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-
-		// Check if the part is a range (e.g., "80-90").
-		if strings.Contains(part, "-") {
-			rangeParts := strings.Split(part, "-")
-			if len(rangeParts) != 2 {
-				return nil, fmt.Errorf("invalid port range: %s", part)
-			}
-
-			startStr := strings.TrimSpace(rangeParts[0])
-			endStr := strings.TrimSpace(rangeParts[1])
-
-			start, err := strconv.Atoi(startStr)
-			if err != nil {
-				return nil, fmt.Errorf("invalid start port in range '%s': %w", part, err)
-			}
-
-			end, err := strconv.Atoi(endStr)
-			if err != nil {
-				return nil, fmt.Errorf("invalid end port in range '%s': %w", part, err)
-			}
-
-			if start > end {
-				return nil, fmt.Errorf("invalid range: start port %d is greater than end port %d", start, end)
-			}
-
-			if start < 1 || end > 65535 {
-				return nil, errors.New("port numbers must be between 1 and 65535")
-			}
-
-			for i := start; i <= end; i++ {
-				ports[i] = struct{}{}
-			}
-		} else {
-			port, err := strconv.Atoi(part)
-			if err != nil {
-				return nil, fmt.Errorf("invalid port number: %s", part)
-			}
-
-			if port < 1 || port > 65535 {
-				return nil, fmt.Errorf("port number %d is out of valid range (1-65535)", port)
-			}
-			ports[port] = struct{}{}
-		}
-	}
-
-	result := make([]int, 0, len(ports))
-	for port := range ports {
-		result = append(result, port)
-	}
-
-	sort.Ints(result)
-	return result, nil
-}
-
 type proberesult struct {
 	address string
 	status  string
 }
 
 type proxyConn struct {
-	//rxChan       chan []byte
-	//rxBuff       bytes.Buffer
 	framer       *http2.Framer
 	proxyAddress string
 	localAddr    string
-	mu           sync.RWMutex      //mutex for conns
+	mu           sync.RWMutex      // mutex for conns
 	conns        map[uint32]string // map streamID to address
 	nextStreamID uint32
 }
@@ -125,7 +54,7 @@ func (t *tunnelConn) Write(b []byte) (n int, err error) {
 }
 
 func (t *tunnelConn) Read(b []byte) (n int, err error) {
-	// If our internal buffer is empty, we need to block and wait for next data
+	// If the internal buffer is empty, block and wait for next data
 	if t.rxBuff.Len() == 0 {
 		data, ok := <-t.rxChan
 		if !ok {
@@ -153,7 +82,13 @@ func (t *tunnelConn) LocalAddr() net.Addr {
 }
 
 func (t *tunnelConn) RemoteAddr() net.Addr {
-	s := strings.Split(t.proxyConn.proxyAddress, ":")
+	t.proxyConn.mu.RLock()
+	address, ok := t.proxyConn.conns[t.streamId]
+	if !ok {
+		log.Println("Could not get RemoteAdrr")
+	}
+	t.proxyConn.mu.RUnlock()
+	s := strings.Split(address, ":")
 	port, err := strconv.Atoi(s[1])
 	if err != nil {
 		log.Printf("Error getting remote address: %s", err)
@@ -189,12 +124,10 @@ func getHTTP2Conn(proxyAddress string) (*http2.Framer, string, net.Conn) {
 	}
 	if url.Scheme == "https" {
 		conn, err = tls.Dial("tcp", url.Host, &tls.Config{InsecureSkipVerify: true})
-		//conn, err = net.Dial("tcp", url.Host)
 		if err != nil {
 			log.Fatalln("Error connecting:", err)
 		}
 	}
-
 	_, err = conn.Write([]byte(http2.ClientPreface))
 	if err != nil {
 		conn.Close()
@@ -204,8 +137,7 @@ func getHTTP2Conn(proxyAddress string) (*http2.Framer, string, net.Conn) {
 
 }
 
-// http2 works now initiate CONNECT tunnel
-func (p *proxyConn) connect(streamID uint32, targetAddress string) {
+func (p *proxyConn) sendConnectReq(streamID uint32, targetAddress string) {
 	p.mu.Lock()
 	p.conns[streamID] = targetAddress
 	p.mu.Unlock()
@@ -236,8 +168,7 @@ func (p *proxyConn) connect(streamID uint32, targetAddress string) {
 
 }
 
-func (p *proxyConn) connectProxy(http2readyChan chan struct{}, resultChan chan proberesult, rxChan chan []byte) { //rxChan chan<- []byte
-	defer close(rxChan)
+func (p *proxyConn) handleProxyConn(http2readyChan chan struct{}, resultChan chan proberesult, rxChan chan []byte) {
 	defer close(http2readyChan)
 	defer close(resultChan)
 
@@ -316,7 +247,7 @@ func (p *proxyConn) connectProxy(http2readyChan chan struct{}, resultChan chan p
 
 func (p *proxyConn) processPorts(ports []int, resultChan chan proberesult, target string) {
 	for _, port := range ports {
-		p.connect(p.nextStreamID, fmt.Sprintf("%s:%d", target, port))
+		p.sendConnectReq(p.nextStreamID, fmt.Sprintf("%s:%d", target, port))
 		p.nextStreamID += 2 // Streams initiated by a client MUST use odd-numbered stream identifiers
 	}
 
@@ -337,33 +268,37 @@ func (p *proxyConn) processPorts(ports []int, resultChan chan proberesult, targe
 
 func (p *proxyConn) getTunnelConn(ports []int, resultChan chan proberesult, target string, rxChan chan []byte) (*tunnelConn, error) {
 	target = fmt.Sprintf("%s:%d", target, ports[0])
-	p.connect(p.nextStreamID, target)
-	for result := range resultChan {
+	p.sendConnectReq(p.nextStreamID, target)
+	select {
+	case result := <-resultChan:
 		if result.status == "connected" && result.address == target {
 			return &tunnelConn{proxyConn: p, rxChan: rxChan, streamId: p.nextStreamID}, nil
 		}
+	case <-time.After(5 * time.Second):
+		return nil, errors.New("timeout waiting to establish connect tunnel")
 	}
-
 	return nil, errors.New("failed to establish connect tunnel")
 }
 
-func exampleTunnelConnUsage(t *tunnelConn) {
+func exampleTunnelConnUsage(t *tunnelConn, useTls bool) {
 	var client net.Conn
 
 	t.proxyConn.mu.RLock()
 	target := t.proxyConn.conns[t.streamId]
 	t.proxyConn.mu.RUnlock()
 
-	// _, err := fmt.Fprintf(t, "GET / HTTP/1.1\r\nHost: %s\r\n\r\n", target) // port is usually omitted for 80/443 but this is still correct
-	// if err != nil {
-	// 	log.Fatalf("Error writing to plain connection: %s", err)
-	// }
-	// client = t
-
-	client = tls.Client(t, &tls.Config{InsecureSkipVerify: true})
-	_, err := fmt.Fprintf(client, "GET / HTTP/1.1\r\nHost: %s\r\n\r\n", target) // port is usually omitted for 80/443 but this is still correct
-	if err != nil {
-		log.Fatalf("Error writing to TLS connection: %s", err)
+	if useTls {
+		client = tls.Client(t, &tls.Config{InsecureSkipVerify: true})
+		_, err := fmt.Fprintf(client, "GET / HTTP/1.1\r\nHost: %s\r\n\r\n", target) // port is usually omitted for 80/443 but this is still correct
+		if err != nil {
+			log.Fatalf("Error writing to TLS connection: %s", err)
+		}
+	} else {
+		_, err := fmt.Fprintf(t, "GET / HTTP/1.1\r\nHost: %s\r\n\r\n", target) // port is usually omitted for 80/443 but this is still correct
+		if err != nil {
+			log.Fatalf("Error writing to plain connection: %s", err)
+		}
+		client = t
 	}
 
 	log.Println("successfully written data")
@@ -371,10 +306,9 @@ func exampleTunnelConnUsage(t *tunnelConn) {
 	for {
 		n, err := client.Read(b)
 		if n > 0 {
-			fmt.Print(string(b[:n])) // IMPORTANT: Only process the sub-slice b[:n] which contains the valid data.
+			fmt.Print(string(b[:n]))
 			if strings.HasSuffix(string(b[:n]), "\r\n") {
 				break
-
 			}
 		}
 		if err != nil {
@@ -387,15 +321,33 @@ func exampleTunnelConnUsage(t *tunnelConn) {
 }
 
 func main() {
-	proxyFlag := flag.String("x", "http://172.17.0.2:10001", "proxy address e.g. \"http://172.17.0.2:10001\"")
-	targetFlag := flag.String("t", "google.de", "target address e.g. \"example.com\"")
-	portsFlag := flag.String("p", "", "port(s) to scan or connect to, format similar to nmap e.g. 80,443,1000-2000")
-	connectModeFlag := flag.Bool("c", false, "create a single CONNECT tunnel")
-	verbose := flag.Bool("v", false, "Enable verbose logging")
-
+	proxyFlag := flag.String("x", "http://172.17.0.2:10001", "Proxy address to connect to e.g. \"http://172.17.0.2:8080\"")
+	targetFlag := flag.String("u", "example.com", "Target host(s) e.g. \"example.com\" or \"1.2.3.4,10.0.1/24\"")
+	portsFlag := flag.String("p", "", "Port(s) to scan or connect to, format similar to nmap e.g. 80,443,1000-2000")
+	connectModeFlag := flag.Bool("c", false, "POC mode to create a single CONNECT tunnel, issue a HTTP/1 GET request and print the result")
+	connectModeTLSFlag := flag.Bool("k", false, "Use TLS in POC mode")
+	verboseFlag := flag.Bool("v", false, "Enable verbose logging")
+	batchSizeFlag := flag.Int("b", 100, "Batch size for port scanning")
+	pauseTimeFlag := flag.String("t", "1s", "Pause time in between batches for port scanning e.g. \"1s\"")
 	flag.Parse()
-	if *verbose {
+
+	if *verboseFlag {
 		slog.SetLogLoggerLevel(slog.LevelDebug)
+	}
+
+	timeout, err := time.ParseDuration(*pauseTimeFlag)
+	if err != nil {
+		log.Fatalf("Invalid timout: %s", err)
+	}
+
+	ports, err := ParsePorts(*portsFlag)
+	if err != nil {
+		log.Fatalf("Invalid port specification: %s", err)
+	}
+
+	targets, err := parseTargets(*targetFlag)
+	if err != nil {
+		log.Fatalf("Error parsing input: %v", err)
 	}
 
 	framer, localAddr, conn := getHTTP2Conn(*proxyFlag)
@@ -405,19 +357,18 @@ func main() {
 	conns := make(map[uint32]string)
 	proxyConn := &proxyConn{framer: framer, localAddr: localAddr, proxyAddress: *proxyFlag, conns: conns, nextStreamID: 1}
 
-	ports, err := ParsePorts(*portsFlag)
-	if err != nil {
-		log.Fatalf("Invalid port specification: %s", err)
-	}
 	var rxChan chan []byte
 	if *connectModeFlag {
 		if len(ports) > 1 {
-			log.Fatalln("Only provide a sinlge port in connect mode")
+			log.Fatalln("Only provide a single port in connect mode")
 		}
-		rxChan = make(chan []byte) // make buffered just in case?
-		go proxyConn.connectProxy(http2readyChan, resultChan, rxChan)
+		if len(targets) > 1 {
+			log.Fatalln("Only provide a single target in connect mode")
+		}
+		rxChan = make(chan []byte)
+		go proxyConn.handleProxyConn(http2readyChan, resultChan, rxChan)
 	} else {
-		go proxyConn.connectProxy(http2readyChan, resultChan, nil)
+		go proxyConn.handleProxyConn(http2readyChan, resultChan, nil)
 	}
 
 	select {
@@ -433,30 +384,26 @@ func main() {
 	slog.Info(fmt.Sprintln("Connected to proxy"))
 
 	if *connectModeFlag {
-		tunnelConn, err := proxyConn.getTunnelConn(ports, resultChan, *targetFlag, rxChan)
+		tunnelConn, err := proxyConn.getTunnelConn(ports, resultChan, targets[0], rxChan)
 		if err != nil {
 			log.Fatalf("%s", err)
 		}
-		exampleTunnelConnUsage(tunnelConn)
+		exampleTunnelConnUsage(tunnelConn, *connectModeTLSFlag)
 
 	} else {
 		// batch requests for port scanning
-		for {
-			if len(ports) <= 100 {
-				proxyConn.processPorts(ports, resultChan, *targetFlag)
-				return
-			} else {
-				proxyConn.processPorts(ports[0:100], resultChan, *targetFlag)
-				ports = ports[100:]
+		for _, target := range targets {
+			for {
+				if len(ports) <= *batchSizeFlag {
+					proxyConn.processPorts(ports, resultChan, target)
+					break
+				} else {
+					proxyConn.processPorts(ports[0:*batchSizeFlag], resultChan, target)
+					ports = ports[*batchSizeFlag:]
+				}
+				//give some time to resolve connections
+				time.Sleep(timeout)
 			}
-			//give some time to resolve connections
-			time.Sleep(time.Second)
 		}
-
 	}
-
-	// strg+c handler
-	// specify how to use connect mode example e.g. tls or plain
-	// support not just h2c but tls too - take it from proxy specification e.g. https://proxy.org
-
 }
