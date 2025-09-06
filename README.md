@@ -1,4 +1,4 @@
-POC tool to abuse misconfigured HTTP/2 proxies.
+POC tool to test HTTP/2 `CONNECT` method. Allows scanning misconfigured proxies for accessible internal services and to establish a connection compatible with `net.Conn`.
 
 Usage:
 ```
@@ -25,13 +25,13 @@ docker run --rm -v ./envoy.yaml:/envoy.yaml:ro envoyproxy/envoy:distroless-v1.35
 
 Examples:
 ```
-└─$ ./http2ConnTun -u 172.17.0.1 -p 8000-9000
+└─$ ./http2ConnTun -p http://172.17.0.2:10001 -u 172.17.0.1 -p 8000-9000
 2025/09/06 21:10:08 INFO Connected to proxy
 2025/09/06 21:10:16 INFO Found open port: 172.17.0.1:8888
 ```
 
 ```
-└─$ ./http2ConnTun -u google.de -p 443 -k -c
+└─$ ./http2ConnTun -p http://172.17.0.2:10001 -u google.de -p 443 -k -c
 2025/09/06 21:11:08 INFO Connected to proxy
 2025/09/06 21:11:08 successfully written data
 HTTP/1.1 301 Moved Permanently
