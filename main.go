@@ -123,7 +123,7 @@ func getHTTP2Conn(proxyAddress string) (*http2.Framer, string, net.Conn) {
 		}
 	}
 	if url.Scheme == "https" {
-		conn, err = tls.Dial("tcp", url.Host, &tls.Config{InsecureSkipVerify: true})
+		conn, err = tls.Dial("tcp", url.Host, &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h2"}})
 		if err != nil {
 			log.Fatalln("Error connecting:", err)
 		}
