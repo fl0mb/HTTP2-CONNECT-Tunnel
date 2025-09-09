@@ -377,11 +377,11 @@ func main() {
 			log.Println("Failed to connect to proxy")
 			return
 		}
+		slog.Info(fmt.Sprintln("Connected to proxy"))
 	case <-time.After(5 * time.Second):
 		log.Println("Timeout waiting for proxy connection")
 		return
 	}
-	slog.Info(fmt.Sprintln("Connected to proxy"))
 
 	if *connectModeFlag {
 		tunnelConn, err := proxyConn.getTunnelConn(ports, resultChan, targets[0], rxChan)
