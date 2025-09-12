@@ -110,30 +110,31 @@ func (p *tunnelConn) SetWriteDeadline(t time.Time) error {
 	return ErrNotImplemented
 }
 
-func getHTTP2Conn(proxyAddress string) (*http2.Framer, string, net.Conn) {
+func getHTTP2Conn(proxyAddress string) (*http2.Framer, string, net.Conn, error) {
 	url, err := url.Parse(proxyAddress)
 	if err != nil {
-		log.Fatalln("Error creating proxy url", err)
+		return nil, "", nil, fmt.Errorf("error creating proxy url %s", err)
 	}
 	var conn net.Conn
 	if url.Scheme == "http" {
-		conn, err = net.Dial("tcp", url.Host)
+		conn, err = net.DialTimeout("tcp", url.Host, timeout)
 		if err != nil {
-			log.Fatalln("Error connecting:", err)
+			return nil, "", nil, fmt.Errorf("error connecting: %s", err)
 		}
 	}
 	if url.Scheme == "https" {
 		conn, err = tls.Dial("tcp", url.Host, &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h2"}})
 		if err != nil {
-			log.Fatalln("Error connecting:", err)
+			return nil, "", nil, fmt.Errorf("error connecting: %s", err)
 		}
+		conn.SetDeadline(time.Now().Add(timeout))
 	}
 	_, err = conn.Write([]byte(http2.ClientPreface))
 	if err != nil {
 		conn.Close()
 		log.Printf("Error writing http2 client preface: %s", err)
 	}
-	return http2.NewFramer(conn, conn), conn.LocalAddr().String(), conn
+	return http2.NewFramer(conn, conn), conn.LocalAddr().String(), conn, nil
 
 }
 
@@ -150,7 +151,7 @@ func (p *proxyConn) sendConnectReq(streamID uint32, targetAddress string) {
 
 	for _, hf := range connectHeaders {
 		if err := hpackEncoder.WriteField(hf); err != nil {
-			log.Fatalf("HPACK encoding failed for %q: %v", hf.Name, err)
+			log.Printf("HPACK encoding failed for %q: %v", hf.Name, err)
 		}
 	}
 
@@ -223,7 +224,8 @@ func (p *proxyConn) handleProxyConn(http2readyChan chan struct{}, resultChan cha
 			if !f.IsAck() {
 				err := p.framer.WriteSettingsAck()
 				if err != nil {
-					log.Fatalf("Error acknowledging settings frame: %s", err)
+					log.Printf("Error acknowledging settings frame: %s for proxy %s", err, p.proxyAddress) // Error handling inside this function is not ideal
+					return
 				}
 			} else {
 				http2readyChan <- struct{}{}
@@ -254,7 +256,7 @@ func (p *proxyConn) processPorts(ports []int, resultChan chan proberesult, targe
 	count := len(ports)
 	for result := range resultChan {
 		if result.status == "connected" {
-			slog.Info(fmt.Sprintf("Found open port: %s", result.address))
+			slog.Info(fmt.Sprintf("Found accessible target: %s for proxy %s", result.address, p.proxyAddress))
 		}
 		if result.status == "rejected" {
 			slog.Debug(fmt.Sprintf("Found closed port: %s", result.address))
@@ -320,51 +322,20 @@ func exampleTunnelConnUsage(t *tunnelConn, useTls bool) {
 	}
 }
 
-func main() {
-	proxyFlag := flag.String("x", "http://172.17.0.2:10001", "Proxy address to connect to e.g. \"http://172.17.0.2:8080\"")
-	targetFlag := flag.String("u", "example.com", "Target host(s) e.g. \"example.com\" or \"1.2.3.4,10.0.1/24\"")
-	portsFlag := flag.String("p", "", "Port(s) to scan or connect to, format similar to nmap e.g. 80,443,1000-2000")
-	connectModeFlag := flag.Bool("c", false, "POC mode to create a single CONNECT tunnel, issue a HTTP/1 GET request and print the result")
-	connectModeTLSFlag := flag.Bool("k", false, "Use TLS in POC mode")
-	verboseFlag := flag.Bool("v", false, "Enable verbose logging")
-	batchSizeFlag := flag.Int("b", 100, "Batch size for port scanning")
-	pauseTimeFlag := flag.String("t", "1s", "Pause time in between batches for port scanning e.g. \"1s\"")
-	flag.Parse()
+var timeout time.Duration
 
-	if *verboseFlag {
-		slog.SetLogLoggerLevel(slog.LevelDebug)
-	}
-
-	timeout, err := time.ParseDuration(*pauseTimeFlag)
+func NewProxyConn(proxyAddress string, connectMode bool) (*proxyConn, chan proberesult, chan []byte, error) {
+	framer, localAddr, conn, err := getHTTP2Conn(proxyAddress)
 	if err != nil {
-		log.Fatalf("Invalid timout: %s", err)
+		return nil, nil, nil, fmt.Errorf("error connteting to proxy %s: %s", proxyAddress, err)
 	}
-
-	ports, err := ParsePorts(*portsFlag)
-	if err != nil {
-		log.Fatalf("Invalid port specification: %s", err)
-	}
-
-	targets, err := parseTargets(*targetFlag)
-	if err != nil {
-		log.Fatalf("Error parsing input: %v", err)
-	}
-
-	framer, localAddr, conn := getHTTP2Conn(*proxyFlag)
-	defer conn.Close()
 	http2readyChan := make(chan struct{})
 	resultChan := make(chan proberesult)
 	conns := make(map[uint32]string)
-	proxyConn := &proxyConn{framer: framer, localAddr: localAddr, proxyAddress: *proxyFlag, conns: conns, nextStreamID: 1}
+	proxyConn := &proxyConn{framer: framer, localAddr: localAddr, proxyAddress: proxyAddress, conns: conns, nextStreamID: 1}
 
 	var rxChan chan []byte
-	if *connectModeFlag {
-		if len(ports) > 1 {
-			log.Fatalln("Only provide a single port in connect mode")
-		}
-		if len(targets) > 1 {
-			log.Fatalln("Only provide a single target in connect mode")
-		}
+	if connectMode {
 		rxChan = make(chan []byte)
 		go proxyConn.handleProxyConn(http2readyChan, resultChan, rxChan)
 	} else {
@@ -374,36 +345,156 @@ func main() {
 	select {
 	case _, ok := <-http2readyChan:
 		if !ok {
-			log.Println("Failed to connect to proxy")
-			return
+			conn.Close() // Ideally it should also be possible to call close for Error conditions outside of this function
+			return nil, nil, nil, fmt.Errorf("failed to connect to proxy %s", proxyAddress)
 		}
 		slog.Info(fmt.Sprintln("Connected to proxy"))
-	case <-time.After(5 * time.Second):
-		log.Println("Timeout waiting for proxy connection")
-		return
+	case <-time.After(timeout):
+		conn.Close()
+		return nil, nil, nil, fmt.Errorf("timeout waiting for proxy connection to %s", proxyAddress)
+	}
+
+	return proxyConn, resultChan, rxChan, nil
+}
+
+// batch requests for port scanning
+func batchProcess(p *proxyConn, targets []string, ports []int, resultChan chan proberesult, batchsize int, waitTime time.Duration) {
+	for _, target := range targets {
+		for {
+			if len(ports) <= batchsize {
+				p.processPorts(ports, resultChan, target)
+				break
+			} else {
+				p.processPorts(ports[0:batchsize], resultChan, target)
+				ports = ports[batchsize:]
+			}
+			//give some time to resolve connections
+			time.Sleep(waitTime)
+		}
+	}
+}
+
+func worker(jobs <-chan func(), wg *sync.WaitGroup) {
+	for job := range jobs {
+		job()
+	}
+	defer wg.Done()
+}
+
+func main() {
+	targetFlag := flag.String("u", "example.com", "Target host(s) e.g. \"example.com\" or \"1.2.3.4,10.0.1/24\"")
+	proxyFlag := flag.String("x", "http://172.17.0.2:10001", "Proxy address to connect to e.g. \"http://172.17.0.2:8080\"")
+	portsFlag := flag.String("p", "", "Port(s) to scan or connect to, format similar to nmap e.g. 80,443,1000-2000")
+	connectModeFlag := flag.Bool("c", false, "POC mode to create a single CONNECT tunnel, issue a HTTP/1 GET request and print the result")
+	connectModeTLSFlag := flag.Bool("k", false, "Use TLS in POC mode")
+	verboseFlag := flag.Bool("v", false, "Enable verbose logging")
+	batchSizeFlag := flag.Int("b", 100, "Batch size for port scanning")
+	waitTimeFlag := flag.String("w", "1s", "Wait time in between batches for port scanning e.g. \"1s\"")
+	timeoutFlag := flag.String("t", "5s", "Timeout for proxy connection e.g. \"1s\"")
+	flag.Parse()
+
+	if *verboseFlag {
+		slog.SetLogLoggerLevel(slog.LevelDebug)
+	}
+
+	waitTime, err := time.ParseDuration(*waitTimeFlag)
+	if err != nil {
+		log.Printf("Invalid wait time: %s", err)
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	timeout, err = time.ParseDuration(*timeoutFlag)
+	if err != nil {
+		log.Printf("Invalid timout: %s", err)
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	ports, err := ParsePorts(*portsFlag)
+	if err != nil {
+		log.Printf("Invalid port specification: %s", err)
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	targets, err := parseAddresses(*targetFlag)
+	if err != nil {
+		log.Printf("Error parsing input: %v", err)
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	var proxies []string
+	if strings.Contains(*proxyFlag, ",") {
+		proxies = strings.Split(*proxyFlag, ",")
+	} else {
+		proxies = append(proxies, *proxyFlag)
 	}
 
 	if *connectModeFlag {
+		if len(ports) > 1 {
+			log.Println("Only provide a single port in connect mode")
+			flag.Usage()
+			os.Exit(1)
+		}
+		if len(targets) > 1 {
+			log.Println("Only provide a single target in connect mode")
+			flag.Usage()
+			os.Exit(1)
+		}
+		if len(proxies) > 1 {
+			log.Println("Only provide a single proxy in connect mode")
+			flag.Usage()
+			os.Exit(1)
+		}
+
+	}
+
+	if *connectModeFlag {
+		proxyConn, resultChan, rxChan, err := NewProxyConn(proxies[0], *connectModeFlag)
+		if err != nil {
+			log.Println(err)
+		}
 		tunnelConn, err := proxyConn.getTunnelConn(ports, resultChan, targets[0], rxChan)
 		if err != nil {
 			log.Fatalf("%s", err)
 		}
 		exampleTunnelConnUsage(tunnelConn, *connectModeTLSFlag)
+		os.Exit(0)
+	}
 
+	if len(proxies) == 1 {
+		proxyConn, resultChan, _, err := NewProxyConn(proxies[0], *connectModeFlag)
+		if err != nil {
+			log.Println(err)
+		}
+		batchProcess(proxyConn, targets, ports, resultChan, *batchSizeFlag, waitTime)
 	} else {
-		// batch requests for port scanning
-		for _, target := range targets {
-			for {
-				if len(ports) <= *batchSizeFlag {
-					proxyConn.processPorts(ports, resultChan, target)
-					break
-				} else {
-					proxyConn.processPorts(ports[0:*batchSizeFlag], resultChan, target)
-					ports = ports[*batchSizeFlag:]
-				}
-				//give some time to resolve connections
-				time.Sleep(timeout)
+		var wgs int
+		if len(proxies) < 20 {
+			wgs = len(proxies)
+		} else {
+			wgs = 20
+		}
+		var wg sync.WaitGroup
+		jobs := make(chan func())
+		for w := 1; w <= wgs; w++ {
+			wg.Add(1)
+			go worker(jobs, &wg)
+		}
+		for _, proxy := range proxies {
+			proxyConn, resultChan, _, err := NewProxyConn(proxy, *connectModeFlag)
+			if err != nil {
+				log.Println(err)
+				continue
+			}
+			jobs <- func() {
+				batchProcess(proxyConn, targets, ports, resultChan, *batchSizeFlag, waitTime)
 			}
 		}
+		close(jobs) //By now all jobs are scheduled and can thus be closed
+		wg.Wait()   // wait until workers are done so that no more matchingEntries can be created
 	}
+
 }

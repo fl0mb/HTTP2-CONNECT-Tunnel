@@ -77,10 +77,10 @@ func ParsePorts(portStr string) ([]int, error) {
 	return result, nil
 }
 
-// parseTargets takes a comma-separated string of IPs, hostnames, and CIDR notations,
+// parseAddresses takes a comma-separated string of IPs, hostnames, and CIDR notations,
 // validates them, expands CIDRs, and returns a slice of targets.
 // Attention: utils.go was vibecoded!
-func parseTargets(targetInput string) ([]string, error) {
+func parseAddresses(targetInput string) ([]string, error) {
 	var targets []string
 	// Split the input string by commas
 	parts := strings.Split(targetInput, ",")
