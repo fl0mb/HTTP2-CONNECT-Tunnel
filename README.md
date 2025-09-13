@@ -1,6 +1,5 @@
-POC tool to test HTTP/2 `CONNECT` method. Allows scanning misconfigured proxies for accessible internal services and to establish a connection compatible with `net.Conn`.
+Tool to play with the HTTP/2 `CONNECT` method. It allows scanning for misconfigured proxies and their accessible internal services. There is also aproof of concept mode to establish a `CONNECT` tunnel that could be used with `net.Conn`.
 
-Usage:
 ```
 Usage of ./http2ConnTun:
   -b int
@@ -9,13 +8,17 @@ Usage of ./http2ConnTun:
   -k	Use TLS in POC mode
   -p string
     	Port(s) to scan or connect to, format similar to nmap e.g. 80,443,1000-2000
+  -proxy-file string
+    	File containing line separated proxy addresses to connect to e.g. "http://172.17.0.2:8080"
   -t string
-    	Pause time in between batches for port scanning e.g. "1s" (default "1s")
+    	Timeout for proxy connection e.g. "1s" (default "5s")
   -u string
-    	Target host(s) e.g. "example.com" or "1.2.3.4,10.0.1/24" (default "example.com")
+    	Target host(s) e.g. "example.com" or "1.2.3.4,10.0.1/24"
   -v	Enable verbose logging
+  -w string
+    	Wait time in between batches for port scanning e.g. "1s" (default "1s")
   -x string
-    	Proxy address to connect to e.g. "http://172.17.0.2:8080" (default "http://172.17.0.2:10001")
+    	Proxy address to connect to e.g. "http://172.17.0.2:8080"
 ```
 
 Start an example envoy server with the provided configuration:
@@ -25,21 +28,33 @@ docker run --rm -v ./envoy.yaml:/envoy.yaml:ro envoyproxy/envoy:distroless-v1.35
 
 Examples:
 ```
-└─$ ./http2ConnTun -p http://172.17.0.2:10001 -u 172.17.0.1 -p 8000-9000
-2025/09/06 21:10:08 INFO Connected to proxy
-2025/09/06 21:10:16 INFO Found open port: 172.17.0.1:8888
+└─$ ./http2ConnTun -x http://172.17.0.2:10001 -u 172.17.0.1 -p 8000-9000
+2025/09/13 10:42:53 INFO Connected to proxy
+2025/09/13 10:43:01 INFO Found accessible target: 172.17.0.1:8888 for proxy http://172.17.0.2:10001
 ```
 
 ```
-└─$ ./http2ConnTun -p http://172.17.0.2:10001 -u google.de -p 443 -k -c
-2025/09/06 21:11:08 INFO Connected to proxy
-2025/09/06 21:11:08 successfully written data
+└─$ ./http2ConnTun -proxy-file proxies.txt -u 127.0.0.1,google.de -p 80,10001
+2025/09/13 10:43:37 error connteting to proxy http://127.0.0.1:80: error connecting: dial tcp 127.0.0.1:80: connect: connection refused
+2025/09/13 10:43:37 INFO Connected to proxy
+2025/09/13 10:43:37 INFO Found accessible target: 127.0.0.1:10001 for proxy http://172.17.0.2:10001
+2025/09/13 10:43:37 INFO Found accessible target: google.de:80 for proxy http://172.17.0.2:10001
+
+└─$ cat proxies.txt 
+http://127.0.0.1:80
+http://172.17.0.2:10001
+```
+
+```
+└─$ ./http2ConnTun -x http://172.17.0.2:10001 -u google.de -p 443 -k -c
+2025/09/13 10:45:05 INFO Connected to proxy
+2025/09/13 10:45:05 successfully written data
 HTTP/1.1 301 Moved Permanently
 Location: https://www.google.de/
 Content-Type: text/html; charset=UTF-8
-Content-Security-Policy-Report-Only: object-src 'none';base-uri 'self';script-src 'nonce-VluL-L66EKtfsrGIeAZ_Dw' 'strict-dynamic' 'report-sample' 'unsafe-eval' 'unsafe-inline' https: http:;report-uri https://csp.withgoogle.com/csp/gws/other-hp
-Date: Sat, 06 Sep 2025 19:11:08 GMT
-Expires: Mon, 06 Oct 2025 19:11:08 GMT
+Content-Security-Policy-Report-Only: object-src 'none';base-uri 'self';script-src 'nonce-dl6_0__SZfVQyRuFO7UTCw' 'strict-dynamic' 'report-sample' 'unsafe-eval' 'unsafe-inline' https: http:;report-uri https://csp.withgoogle.com/csp/gws/other-hp
+Date: Sat, 13 Sep 2025 08:45:05 GMT
+Expires: Mon, 13 Oct 2025 08:45:05 GMT
 Cache-Control: public, max-age=2592000
 Server: gws
 Content-Length: 219

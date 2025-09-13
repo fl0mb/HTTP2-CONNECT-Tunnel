@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
+	"log"
 	"net"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -136,4 +139,24 @@ func inc(ip net.IP) {
 			break
 		}
 	}
+}
+
+func readProxies(fileName string) []string {
+	file, err := os.Open(fileName)
+	if err != nil {
+		log.Fatalf("failed to open file: %s", err)
+	}
+	defer file.Close()
+
+	var proxies []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		proxies = append(proxies, scanner.Text())
+	}
+
+	// Check for errors during scanning.
+	if err := scanner.Err(); err != nil {
+		log.Fatalf("error during file scan: %s", err)
+	}
+	return proxies
 }

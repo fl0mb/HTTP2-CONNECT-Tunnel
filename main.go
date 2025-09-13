@@ -327,7 +327,7 @@ var timeout time.Duration
 func NewProxyConn(proxyAddress string, connectMode bool) (*proxyConn, chan proberesult, chan []byte, error) {
 	framer, localAddr, conn, err := getHTTP2Conn(proxyAddress)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("error connteting to proxy %s: %s", proxyAddress, err)
+		return nil, nil, nil, fmt.Errorf("error connecting to proxy %s: %s", proxyAddress, err)
 	}
 	http2readyChan := make(chan struct{})
 	resultChan := make(chan proberesult)
@@ -382,8 +382,9 @@ func worker(jobs <-chan func(), wg *sync.WaitGroup) {
 }
 
 func main() {
-	targetFlag := flag.String("u", "example.com", "Target host(s) e.g. \"example.com\" or \"1.2.3.4,10.0.1/24\"")
-	proxyFlag := flag.String("x", "http://172.17.0.2:10001", "Proxy address to connect to e.g. \"http://172.17.0.2:8080\"")
+	targetFlag := flag.String("u", "", "Target host(s) e.g. \"example.com\" or \"1.2.3.4,10.0.1/24\"")
+	proxyFlag := flag.String("x", "", "Proxy address to connect to e.g. \"http://172.17.0.2:8080\"")
+	proxyFileFlag := flag.String("proxy-file", "", "File containing line separated proxy addresses to connect to e.g. \"http://172.17.0.2:8080\"")
 	portsFlag := flag.String("p", "", "Port(s) to scan or connect to, format similar to nmap e.g. 80,443,1000-2000")
 	connectModeFlag := flag.Bool("c", false, "POC mode to create a single CONNECT tunnel, issue a HTTP/1 GET request and print the result")
 	connectModeTLSFlag := flag.Bool("k", false, "Use TLS in POC mode")
@@ -392,6 +393,12 @@ func main() {
 	waitTimeFlag := flag.String("w", "1s", "Wait time in between batches for port scanning e.g. \"1s\"")
 	timeoutFlag := flag.String("t", "5s", "Timeout for proxy connection e.g. \"1s\"")
 	flag.Parse()
+
+	if *proxyFileFlag != "" && *proxyFlag != "" {
+		log.Println("Specify proxy addresses either in the cli (-x) or as a file (--proxy-file)")
+		flag.Usage()
+		os.Exit(1)
+	}
 
 	if *verboseFlag {
 		slog.SetLogLoggerLevel(slog.LevelDebug)
@@ -418,18 +425,32 @@ func main() {
 		os.Exit(1)
 	}
 
-	targets, err := parseAddresses(*targetFlag)
-	if err != nil {
-		log.Printf("Error parsing input: %v", err)
+	var targets []string
+	if *targetFlag != "" {
+		targets, err = parseAddresses(*targetFlag)
+		if err != nil {
+			log.Printf("Error parsing input: %v", err)
+			flag.Usage()
+			os.Exit(1)
+		}
+	} else {
+		log.Println("No targets specified")
 		flag.Usage()
 		os.Exit(1)
 	}
 
 	var proxies []string
-	if strings.Contains(*proxyFlag, ",") {
+	switch {
+	case *proxyFlag != "" && strings.Contains(*proxyFlag, ","):
 		proxies = strings.Split(*proxyFlag, ",")
-	} else {
+	case *proxyFlag != "":
 		proxies = append(proxies, *proxyFlag)
+	case *proxyFileFlag != "":
+		proxies = append(proxies, readProxies(*proxyFileFlag)...)
+	default:
+		log.Println("No proxies specified")
+		flag.Usage()
+		os.Exit(1)
 	}
 
 	if *connectModeFlag {
@@ -454,7 +475,7 @@ func main() {
 	if *connectModeFlag {
 		proxyConn, resultChan, rxChan, err := NewProxyConn(proxies[0], *connectModeFlag)
 		if err != nil {
-			log.Println(err)
+			log.Fatalf("%s", err)
 		}
 		tunnelConn, err := proxyConn.getTunnelConn(ports, resultChan, targets[0], rxChan)
 		if err != nil {
