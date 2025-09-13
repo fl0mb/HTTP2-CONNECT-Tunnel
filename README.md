@@ -24,6 +24,7 @@ Usage of ./http2ConnTun:
 Start an example envoy server with the provided configuration:
 ```bash
 docker run --rm -v ./envoy.yaml:/envoy.yaml:ro envoyproxy/envoy:distroless-v1.35-latest -c /envoy.yaml
+docker run --rm -p 8080:8080 -v ./httpd.conf:/usr/local/apache2/conf/httpd.conf httpd:2.4.65
 ```
 
 Examples:
