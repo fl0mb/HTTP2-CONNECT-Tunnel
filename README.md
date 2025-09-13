@@ -21,7 +21,7 @@ Usage of ./http2ConnTun:
     	Proxy address to connect to e.g. "http://172.17.0.2:8080"
 ```
 
-Start an example envoy server with the provided configuration:
+Start an example envoy or apache httpd server with the provided configurations:
 ```bash
 docker run --rm -v ./envoy.yaml:/envoy.yaml:ro envoyproxy/envoy:distroless-v1.35-latest -c /envoy.yaml
 docker run --rm -p 8080:8080 -v ./httpd.conf:/usr/local/apache2/conf/httpd.conf httpd:2.4.65

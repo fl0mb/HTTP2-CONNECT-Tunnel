@@ -488,7 +488,7 @@ func main() {
 	if len(proxies) == 1 {
 		proxyConn, resultChan, _, err := NewProxyConn(proxies[0], *connectModeFlag)
 		if err != nil {
-			log.Println(err)
+			log.Fatalf("%s", err)
 		}
 		batchProcess(proxyConn, targets, ports, resultChan, *batchSizeFlag, waitTime)
 	} else {
