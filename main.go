@@ -147,6 +147,16 @@ func (p *proxyConn) sendConnectReq(streamID uint32, targetAddress string) {
 	connectHeaders := []hpack.HeaderField{
 		{Name: ":method", Value: "CONNECT"},
 		{Name: ":authority", Value: targetAddress},
+		// rfc 8441 websocket with http2
+		// {Name: ":protocol", Value: "websocket"},
+		// {Name: ":scheme", Value: "http"}, // https=wss
+		// {Name: ":path", Value: "/ws"},    // http2 always require at least /
+		// {Name: "sec-websocket-version", Value: "13"},
+		// optional values
+		// Testserver wss://echo.websocket.org
+		// sec-websocket-protocol = chat, superchat
+		// sec-websocket-extensions = permessage-deflate
+		// origin
 	}
 
 	for _, hf := range connectHeaders {
