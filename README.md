@@ -1,4 +1,6 @@
-Tool to play with the HTTP/2 `CONNECT` method. It allows scanning for misconfigured proxies and their accessible internal services. There is also aproof of concept mode to establish a `CONNECT` tunnel that could be used with `net.Conn`.
+Tool to play with the HTTP/2 `CONNECT` method. It allows scanning for misconfigured proxies and their accessible internal services. There is also a proof of concept mode to establish a `CONNECT` tunnel that could be used with `net.Conn`.
+
+For details, see the [blog post](https://blog.flomb.net/posts/http2connect/)
 
 ```
 Usage of ./http2ConnTun:
