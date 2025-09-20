@@ -384,6 +384,26 @@ func batchProcess(p *proxyConn, targets []string, ports []int, resultChan chan p
 	}
 }
 
+func localForwarder(tunnel *tunnelConn, l net.Listener) {
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			log.Fatal(err)
+		}
+		go forward(tunnel, conn)
+		go forward(conn, tunnel)
+	}
+}
+
+func forward(dst io.Writer, src io.Reader) {
+	_, err := io.Copy(dst, src)
+	if err != nil {
+		log.Fatalf("Error forwarding: %s", err)
+		return
+	}
+
+}
+
 func worker(jobs <-chan func(), wg *sync.WaitGroup) {
 	for job := range jobs {
 		job()
@@ -396,8 +416,8 @@ func main() {
 	proxyFlag := flag.String("x", "", "Proxy address to connect to e.g. \"http://172.17.0.2:8080\"")
 	proxyFileFlag := flag.String("proxy-file", "", "File containing line separated proxy addresses to connect to e.g. \"http://172.17.0.2:8080\"")
 	portsFlag := flag.String("p", "", "Port(s) to scan or connect to, format similar to nmap e.g. 80,443,1000-2000")
-	connectModeFlag := flag.Bool("c", false, "POC mode to create a single CONNECT tunnel, issue a HTTP/1 GET request and print the result")
-	connectModeTLSFlag := flag.Bool("k", false, "Use TLS in POC mode")
+	connectModeFlag := flag.Bool("c", false, "enable connection mode, where a local listener forwards traffic into and out of the CONNECT tunnel")
+	localListenerFlag := flag.String("l", "127.0.0.1:8080", "Address of local listener for connect mode")
 	verboseFlag := flag.Bool("v", false, "Enable verbose logging")
 	batchSizeFlag := flag.Int("b", 100, "Batch size for port scanning")
 	waitTimeFlag := flag.String("w", "1s", "Wait time in between batches for port scanning e.g. \"1s\"")
@@ -483,6 +503,12 @@ func main() {
 	}
 
 	if *connectModeFlag {
+		l, err := net.Listen("tcp", *localListenerFlag)
+		if err != nil {
+			log.Fatalf("Failed to create local listener: %s", err)
+		}
+		defer l.Close()
+
 		proxyConn, resultChan, rxChan, err := NewProxyConn(proxies[0], *connectModeFlag)
 		if err != nil {
 			log.Fatalf("%s", err)
@@ -491,7 +517,9 @@ func main() {
 		if err != nil {
 			log.Fatalf("%s", err)
 		}
-		exampleTunnelConnUsage(tunnelConn, *connectModeTLSFlag)
+		//exampleTunnelConnUsage(tunnelConn, *connectModeTLSFlag)
+
+		localForwarder(tunnelConn, l)
 		os.Exit(0)
 	}
 

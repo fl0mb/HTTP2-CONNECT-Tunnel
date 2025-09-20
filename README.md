@@ -6,8 +6,9 @@ For details, see the [blog post](https://blog.flomb.net/posts/http2connect/)
 Usage of ./http2ConnTun:
   -b int
     	Batch size for port scanning (default 100)
-  -c	POC mode to create a single CONNECT tunnel, issue a HTTP/1 GET request and print the result
-  -k	Use TLS in POC mode
+  -c	enable connection mode, where a local listener forwards traffic into and out of the CONNECT tunnel
+  -l string
+    	Address of local listener for connect mode (default "127.0.0.1:8080")
   -p string
     	Port(s) to scan or connect to, format similar to nmap e.g. 80,443,1000-2000
   -proxy-file string
@@ -29,13 +30,16 @@ docker run --rm -v ./envoy.yaml:/envoy.yaml:ro envoyproxy/envoy:distroless-v1.35
 docker run --rm -p 8080:8080 -v ./httpd.conf:/usr/local/apache2/conf/httpd.conf httpd:2.4.65
 ```
 
-Examples:
+
+Probe a single potential proxy for a address and a range of ports:
 ```
 └─$ ./http2ConnTun -x http://172.17.0.2:10001 -u 172.17.0.1 -p 8000-9000
 2025/09/13 10:42:53 INFO Connected to proxy
 2025/09/13 10:43:01 INFO Found accessible target: 172.17.0.1:8888 for proxy http://172.17.0.2:10001
 ```
 
+
+Probe multiple potential proxies for multiple addresses and ports:
 ```
 └─$ ./http2ConnTun -proxy-file proxies.txt -u 127.0.0.1,google.de -p 80,10001
 2025/09/13 10:43:37 error connteting to proxy http://127.0.0.1:80: error connecting: dial tcp 127.0.0.1:80: connect: connection refused
@@ -48,27 +52,17 @@ http://127.0.0.1:80
 http://172.17.0.2:10001
 ```
 
+In connect mode establish a `CONNECT` tunnel and forward everything received on a local listener into the tunnel:
 ```
-└─$ ./http2ConnTun -x http://172.17.0.2:10001 -u google.de -p 443 -k -c
-2025/09/13 10:45:05 INFO Connected to proxy
-2025/09/13 10:45:05 successfully written data
-HTTP/1.1 301 Moved Permanently
-Location: https://www.google.de/
-Content-Type: text/html; charset=UTF-8
-Content-Security-Policy-Report-Only: object-src 'none';base-uri 'self';script-src 'nonce-dl6_0__SZfVQyRuFO7UTCw' 'strict-dynamic' 'report-sample' 'unsafe-eval' 'unsafe-inline' https: http:;report-uri https://csp.withgoogle.com/csp/gws/other-hp
-Date: Sat, 13 Sep 2025 08:45:05 GMT
-Expires: Mon, 13 Oct 2025 08:45:05 GMT
-Cache-Control: public, max-age=2592000
-Server: gws
-Content-Length: 219
-X-XSS-Protection: 0
-X-Frame-Options: SAMEORIGIN
-Alt-Svc: h3=":443"; ma=2592000,h3-29=":443"; ma=2592000
+└─$ ./http2ConnTun -x http://172.17.0.2:8080 -u google.de -p 80 -c -l 127.0.0.1:8000
+2025/09/20 20:56:02 INFO Connected to proxy
 
+
+└─$ curl http://127.0.0.1:8000
 <HTML><HEAD><meta http-equiv="content-type" content="text/html;charset=utf-8">
 <TITLE>301 Moved</TITLE></HEAD><BODY>
 <H1>301 Moved</H1>
 The document has moved
-<A HREF="https://www.google.de/">here</A>.
+<A HREF="http://www.google.com:8000/">here</A>.
 </BODY></HTML>
 ```
