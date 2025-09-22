@@ -202,15 +202,20 @@ func (p *proxyConn) handleProxyConn(http2readyChan chan struct{}, resultChan cha
 			//log.Debug(fmt.Sprintf("%s", f.Data()))
 			data := f.Data()
 			if bytes.HasPrefix(data, []byte("no healthy upstream")) {
-				slog.Info(fmt.Sprintln("Aborting: unhealthy envoy"))
-				os.Exit(1)
+				p.mu.RLock()
+				address, ok := p.conns[f.StreamID]
+				p.mu.RUnlock()
+				if ok {
+					resultChan <- proberesult{address: address, status: "rejected"}
+				}
+				slog.Info(fmt.Sprintln("Aborting: unhealthy envoy proxy"))
 			}
 			if rxChan != nil {
 				rxChan <- data
 			}
 		case *http2.PingFrame:
 			slog.Debug(fmt.Sprintf("Received frame: %v\n", f.FrameHeader.Type))
-			//p.framer.WritePing(true)
+			p.framer.WritePing(true, f.Data)
 		case *http2.MetaHeadersFrame:
 			slog.Debug(fmt.Sprintf("Received frame: %v\n", f.FrameHeader.Type))
 			for _, v := range f.Fields {
@@ -227,8 +232,13 @@ func (p *proxyConn) handleProxyConn(http2readyChan chan struct{}, resultChan cha
 			}
 
 		case *http2.GoAwayFrame:
-			slog.Info(fmt.Sprintln("Aborting: received GoAwayFrame"))
-			os.Exit(1)
+			p.mu.RLock()
+			address, ok := p.conns[f.StreamID]
+			p.mu.RUnlock()
+			if ok {
+				resultChan <- proberesult{address: address, status: "rejected"}
+			}
+			slog.Info(fmt.Sprintf("Received GoAwayFrame for stream %d", f.StreamID))
 		case *http2.SettingsFrame:
 			slog.Debug(fmt.Sprintf("Received frame: %v, ACK: %t\n", f.FrameHeader.Type, f.IsAck()))
 			if !f.IsAck() {
