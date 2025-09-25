@@ -22,9 +22,8 @@ import (
 	"golang.org/x/net/http2/hpack"
 )
 
-func NoRedirect(req *http.Request, via []*http.Request) error {
-	return http.ErrUseLastResponse
-}
+var timeout time.Duration
+var ErrNotImplemented = errors.New("not implemented")
 
 type proberesult struct {
 	address string
@@ -68,6 +67,7 @@ func (t *tunnelConn) Read(b []byte) (n int, err error) {
 }
 
 func (t *tunnelConn) Close() error {
+	// fatal is fine here as this is only used in connect mode which is limited to a single connection
 	log.Fatalln("Proxy connection closed")
 	return nil
 }
@@ -96,8 +96,6 @@ func (t *tunnelConn) RemoteAddr() net.Addr {
 	return &net.TCPAddr{IP: net.IP(s[0]), Port: port}
 }
 
-var ErrNotImplemented = errors.New("not implemented")
-
 func (p *tunnelConn) SetDeadline(t time.Time) error {
 	return ErrNotImplemented
 }
@@ -108,34 +106,6 @@ func (p *tunnelConn) SetReadDeadline(t time.Time) error {
 
 func (p *tunnelConn) SetWriteDeadline(t time.Time) error {
 	return ErrNotImplemented
-}
-
-func getHTTP2Conn(proxyAddress string) (*http2.Framer, string, net.Conn, error) {
-	url, err := url.Parse(proxyAddress)
-	if err != nil {
-		return nil, "", nil, fmt.Errorf("error creating proxy url %s", err)
-	}
-	var conn net.Conn
-	if url.Scheme == "http" {
-		conn, err = net.DialTimeout("tcp", url.Host, timeout)
-		if err != nil {
-			return nil, "", nil, fmt.Errorf("error connecting: %s", err)
-		}
-	}
-	if url.Scheme == "https" {
-		conn, err = tls.Dial("tcp", url.Host, &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h2"}})
-		if err != nil {
-			return nil, "", nil, fmt.Errorf("error connecting: %s", err)
-		}
-		conn.SetDeadline(time.Now().Add(timeout))
-	}
-	_, err = conn.Write([]byte(http2.ClientPreface))
-	if err != nil {
-		conn.Close()
-		log.Printf("Error writing http2 client preface: %s", err)
-	}
-	return http2.NewFramer(conn, conn), conn.LocalAddr().String(), conn, nil
-
 }
 
 func (p *proxyConn) sendConnectReq(streamID uint32, targetAddress string) {
@@ -238,14 +208,15 @@ func (p *proxyConn) handleProxyConn(http2readyChan chan struct{}, resultChan cha
 			if ok {
 				resultChan <- proberesult{address: address, status: "rejected"}
 			}
-			slog.Info(fmt.Sprintf("Received GoAwayFrame for stream %d", f.StreamID))
+			slog.Info(fmt.Sprintf("Received GoAwayFrame, closing connection to %s", p.proxyAddress))
 		case *http2.SettingsFrame:
 			slog.Debug(fmt.Sprintf("Received frame: %v, ACK: %t\n", f.FrameHeader.Type, f.IsAck()))
 			if !f.IsAck() {
 				err := p.framer.WriteSettingsAck()
 				if err != nil {
-					log.Printf("Error acknowledging settings frame: %s for proxy %s", err, p.proxyAddress) // Error handling inside this function is not ideal
-					return
+					log.Printf("Error acknowledging settings frame: %s for proxy %s", err, p.proxyAddress)
+					// Not ideal
+					// return
 				}
 			} else {
 				http2readyChan <- struct{}{}
@@ -296,53 +267,56 @@ func (p *proxyConn) getTunnelConn(ports []int, resultChan chan proberesult, targ
 		if result.status == "connected" && result.address == target {
 			return &tunnelConn{proxyConn: p, rxChan: rxChan, streamId: p.nextStreamID}, nil
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(timeout):
 		return nil, errors.New("timeout waiting to establish connect tunnel")
 	}
 	return nil, errors.New("failed to establish connect tunnel")
 }
 
-func exampleTunnelConnUsage(t *tunnelConn, useTls bool) {
-	var client net.Conn
-
-	t.proxyConn.mu.RLock()
-	target := t.proxyConn.conns[t.streamId]
-	t.proxyConn.mu.RUnlock()
-
-	if useTls {
-		client = tls.Client(t, &tls.Config{InsecureSkipVerify: true})
-		_, err := fmt.Fprintf(client, "GET / HTTP/1.1\r\nHost: %s\r\n\r\n", target) // port is usually omitted for 80/443 but this is still correct
-		if err != nil {
-			log.Fatalf("Error writing to TLS connection: %s", err)
-		}
-	} else {
-		_, err := fmt.Fprintf(t, "GET / HTTP/1.1\r\nHost: %s\r\n\r\n", target) // port is usually omitted for 80/443 but this is still correct
-		if err != nil {
-			log.Fatalf("Error writing to plain connection: %s", err)
-		}
-		client = t
-	}
-
-	log.Println("successfully written data")
-	b := make([]byte, 512)
-	for {
-		n, err := client.Read(b)
-		if n > 0 {
-			fmt.Print(string(b[:n]))
-			if strings.HasSuffix(string(b[:n]), "\r\n") {
+// batch requests for port scanning
+func (p *proxyConn) batchProcess(targets []string, ports []int, resultChan chan proberesult, batchsize int, waitTime time.Duration) {
+	for _, target := range targets {
+		for {
+			if len(ports) <= batchsize {
+				p.processPorts(ports, resultChan, target)
 				break
+			} else {
+				p.processPorts(ports[0:batchsize], resultChan, target)
+				ports = ports[batchsize:]
 			}
-		}
-		if err != nil {
-			if err != io.EOF {
-				log.Printf("Error reading from proxy connection: %s", err)
-			}
-			break
+			//give some time to resolve connections
+			time.Sleep(waitTime)
 		}
 	}
 }
 
-var timeout time.Duration
+func getHTTP2Conn(proxyAddress string) (*http2.Framer, string, net.Conn, error) {
+	url, err := url.Parse(proxyAddress)
+	if err != nil {
+		return nil, "", nil, fmt.Errorf("error creating proxy url %s", err)
+	}
+	var conn net.Conn
+	if url.Scheme == "http" {
+		conn, err = net.DialTimeout("tcp", url.Host, timeout)
+		if err != nil {
+			return nil, "", nil, fmt.Errorf("error connecting: %s", err)
+		}
+	}
+	if url.Scheme == "https" {
+		conn, err = tls.Dial("tcp", url.Host, &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h2"}})
+		if err != nil {
+			return nil, "", nil, fmt.Errorf("error connecting: %s", err)
+		}
+		conn.SetDeadline(time.Now().Add(timeout))
+	}
+	_, err = conn.Write([]byte(http2.ClientPreface))
+	if err != nil {
+		conn.Close()
+		log.Printf("Error writing http2 client preface: %s", err)
+	}
+	return http2.NewFramer(conn, conn), conn.LocalAddr().String(), conn, nil
+
+}
 
 func NewProxyConn(proxyAddress string, connectMode bool) (*proxyConn, chan proberesult, chan []byte, error) {
 	framer, localAddr, conn, err := getHTTP2Conn(proxyAddress)
@@ -368,7 +342,7 @@ func NewProxyConn(proxyAddress string, connectMode bool) (*proxyConn, chan probe
 			conn.Close() // Ideally it should also be possible to call close for Error conditions outside of this function
 			return nil, nil, nil, fmt.Errorf("failed to connect to proxy %s", proxyAddress)
 		}
-		slog.Info(fmt.Sprintln("Connected to proxy"))
+		slog.Info(fmt.Sprintf("Connected to proxy %s", proxyAddress))
 	case <-time.After(timeout):
 		conn.Close()
 		return nil, nil, nil, fmt.Errorf("timeout waiting for proxy connection to %s", proxyAddress)
@@ -377,24 +351,7 @@ func NewProxyConn(proxyAddress string, connectMode bool) (*proxyConn, chan probe
 	return proxyConn, resultChan, rxChan, nil
 }
 
-// batch requests for port scanning
-func batchProcess(p *proxyConn, targets []string, ports []int, resultChan chan proberesult, batchsize int, waitTime time.Duration) {
-	for _, target := range targets {
-		for {
-			if len(ports) <= batchsize {
-				p.processPorts(ports, resultChan, target)
-				break
-			} else {
-				p.processPorts(ports[0:batchsize], resultChan, target)
-				ports = ports[batchsize:]
-			}
-			//give some time to resolve connections
-			time.Sleep(waitTime)
-		}
-	}
-}
-
-func localForwarder(tunnel *tunnelConn, l net.Listener) {
+func localTCPForwarder(tunnel *tunnelConn, l net.Listener) {
 	for {
 		conn, err := l.Accept()
 		if err != nil {
@@ -421,6 +378,50 @@ func worker(jobs <-chan func(), wg *sync.WaitGroup) {
 	defer wg.Done()
 }
 
+func NoRedirect(req *http.Request, via []*http.Request) error {
+	return http.ErrUseLastResponse
+}
+
+// func exampleTunnelConnUsage(t *tunnelConn, useTls bool) {
+// 	var client net.Conn
+
+// 	t.proxyConn.mu.RLock()
+// 	target := t.proxyConn.conns[t.streamId]
+// 	t.proxyConn.mu.RUnlock()
+
+// 	if useTls {
+// 		client = tls.Client(t, &tls.Config{InsecureSkipVerify: true})
+// 		_, err := fmt.Fprintf(client, "GET / HTTP/1.1\r\nHost: %s\r\n\r\n", target) // port is usually omitted for 80/443 but this is still correct
+// 		if err != nil {
+// 			log.Fatalf("Error writing to TLS connection: %s", err)
+// 		}
+// 	} else {
+// 		_, err := fmt.Fprintf(t, "GET / HTTP/1.1\r\nHost: %s\r\n\r\n", target) // port is usually omitted for 80/443 but this is still correct
+// 		if err != nil {
+// 			log.Fatalf("Error writing to plain connection: %s", err)
+// 		}
+// 		client = t
+// 	}
+
+// 	log.Println("successfully written data")
+// 	b := make([]byte, 512)
+// 	for {
+// 		n, err := client.Read(b)
+// 		if n > 0 {
+// 			fmt.Print(string(b[:n]))
+// 			if strings.HasSuffix(string(b[:n]), "\r\n") {
+// 				break
+// 			}
+// 		}
+// 		if err != nil {
+// 			if err != io.EOF {
+// 				log.Printf("Error reading from proxy connection: %s", err)
+// 			}
+// 			break
+// 		}
+// 	}
+// }
+
 func main() {
 	targetFlag := flag.String("u", "", "Target host(s) e.g. \"example.com\" or \"1.2.3.4,10.0.1/24\"")
 	proxyFlag := flag.String("x", "", "Proxy address to connect to e.g. \"http://172.17.0.2:8080\"")
@@ -432,6 +433,7 @@ func main() {
 	batchSizeFlag := flag.Int("b", 100, "Batch size for port scanning")
 	waitTimeFlag := flag.String("w", "1s", "Wait time in between batches for port scanning e.g. \"1s\"")
 	timeoutFlag := flag.String("t", "5s", "Timeout for proxy connection e.g. \"1s\"")
+	threadsFlag := flag.Int("threads", 20, "Number of threads e.g. parallel proxy connections that are being worked on")
 	flag.Parse()
 
 	if *proxyFileFlag != "" && *proxyFlag != "" {
@@ -440,6 +442,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	log.SetOutput(os.Stdout)
 	if *verboseFlag {
 		slog.SetLogLoggerLevel(slog.LevelDebug)
 	}
@@ -529,7 +532,7 @@ func main() {
 		}
 		//exampleTunnelConnUsage(tunnelConn, *connectModeTLSFlag)
 
-		localForwarder(tunnelConn, l)
+		localTCPForwarder(tunnelConn, l)
 		os.Exit(0)
 	}
 
@@ -538,13 +541,13 @@ func main() {
 		if err != nil {
 			log.Fatalf("%s", err)
 		}
-		batchProcess(proxyConn, targets, ports, resultChan, *batchSizeFlag, waitTime)
+		proxyConn.batchProcess(targets, ports, resultChan, *batchSizeFlag, waitTime)
 	} else {
 		var wgs int
-		if len(proxies) < 20 {
+		if len(proxies) < *threadsFlag {
 			wgs = len(proxies)
 		} else {
-			wgs = 20
+			wgs = *threadsFlag
 		}
 		var wg sync.WaitGroup
 		jobs := make(chan func())
@@ -559,7 +562,7 @@ func main() {
 				continue
 			}
 			jobs <- func() {
-				batchProcess(proxyConn, targets, ports, resultChan, *batchSizeFlag, waitTime)
+				proxyConn.batchProcess(targets, ports, resultChan, *batchSizeFlag, waitTime)
 			}
 		}
 		close(jobs) //By now all jobs are scheduled and can thus be closed
