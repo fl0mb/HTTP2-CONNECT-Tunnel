@@ -188,16 +188,29 @@ func (p *proxyConn) handleProxyConn(http2readyChan chan struct{}, resultChan cha
 			p.framer.WritePing(true, f.Data)
 		case *http2.MetaHeadersFrame:
 			slog.Debug(fmt.Sprintf("Received frame: %v\n", f.FrameHeader.Type))
-			for _, v := range f.Fields {
-				slog.Debug(fmt.Sprintf("\t%s: %s\n", v.Name, v.Value))
+
+			var status200, contentType bool
+
+			for _, field := range f.Fields {
+				slog.Debug(fmt.Sprintf("\t%s: %s\n", field.Name, field.Value))
+
 				// CONNECT tunnel established
-				if v.Name == ":status" && v.Value == "200" {
-					p.mu.RLock()
-					address, ok := p.conns[f.StreamID]
-					p.mu.RUnlock()
-					if ok {
-						resultChan <- proberesult{address: address, status: "connected"}
-					}
+				if field.Name == ":status" && field.Value == "200" {
+					status200 = true
+				}
+
+				// Filter false positives that replay with normal data to every request method
+				if field.Name == "content-type" || field.Name == "content-length" {
+					contentType = true
+				}
+			}
+
+			if status200 && !contentType {
+				p.mu.RLock()
+				address, ok := p.conns[f.StreamID]
+				p.mu.RUnlock()
+				if ok {
+					resultChan <- proberesult{address: address, status: "connected"}
 				}
 			}
 
